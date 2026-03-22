@@ -44,22 +44,25 @@ To prevent code conflicts and keep the main project stable, please follow this b
 
 1. Never work directly on main. Always create a new branch for the specific feature or bug you are working on.
    
-bash
+```bash
 git checkout -b feature/lora-initialization
 # or
 git checkout -b ui/oled-menu-design
+```
 2. Commit your changes regularly.
 Write clear, descriptive commit messages.
    
-bash
+```bash
 git add .
 git commit -m "Added initial LoRa packet transmission logic"
+```
 3. Sync before you push.
 Always pull the latest changes from main before pushing your branch to GitHub.
    
-bash
+```bash
 git pull origin main
 git push origin feature/lora-initialization
+```
 4. Create a Pull Request (PR).
 Go to GitHub and open a PR to merge your feature branch into main. Tag your teammates to review the code before merging.
 
