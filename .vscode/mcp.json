@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "SPECTRE_OS Docs": {
+      "type": "sse",
+      "url": "https://gitmcp.io/krishnag-12/SPECTRE_OS"
+    }
+  }
+}
