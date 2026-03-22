@@ -67,7 +67,6 @@ git push origin feature/lora-initialization
 Go to GitHub and open a PR to merge your feature branch into main. Tag your teammates to review the code before merging.
 
 📁 Project Structure
-Plaintext
 SPECTRE_OS/
 ├── .vscode/               # IDE and MCP configurations
 ├── include/               # Custom header files (.h)
