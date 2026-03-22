@@ -1,3 +1,4 @@
+```
 # SPECTRE_OS 📡
 
 **SPECTRE_OS** is a decentralized, off-grid communication device built to operate without reliance on traditional cellular or internet infrastructure. By leveraging the power of ESP32 microcontrollers and long-range LoRa radio frequency, this system enables secure, peer-to-peer messaging and data transfer.
@@ -34,34 +35,66 @@ This project uses **PlatformIO** (via VS Code) rather than the standard Arduino 
 3. Clone this repository to your local machine:
    ```bash
    git clone [https://github.com/krishnag-12/SPECTRE_OS.git](https://github.com/krishnag-12/SPECTRE_OS.git)
-Open the cloned SPECTRE_OS folder in VS Code. PlatformIO will automatically read the platformio.ini file and download all necessary libraries (RadioLib, AceButton, and your chosen Display library).
+
+```
+
+1.  Open the cloned `SPECTRE_OS` folder in VS Code. PlatformIO will automatically read the `platformio.ini` file and download all necessary libraries (RadioLib, AceButton, and your chosen Display library).
+
+* * * * *
 
 📚 Project Documentation (MCP)
-This repository is configured with a Model Context Protocol (MCP) server to keep workspace documentation synced. Ensure your IDE is reading the .vscode/mcp.json file to securely access the latest architectural docs and driver specifications.
+------------------------------
+
+This repository is configured with a Model Context Protocol (MCP) server to keep workspace documentation synced. Ensure your IDE is reading the `.vscode/mcp.json` file to securely access the latest architectural docs and driver specifications.
+
+* * * * *
 
 🌿 Contribution Guidelines & Git Workflow
+-----------------------------------------
+
 To prevent code conflicts and keep the main project stable, please follow this branching workflow:
 
-Never work directly on main. Always create a new branch for the specific feature or bug you are working on.
+**1\. Never work directly on `main`.** Always create a new branch for the specific feature or bug you are working on.
 
 Bash
+
+```
 git checkout -b feature/lora-initialization
 # or
 git checkout -b ui/oled-menu-design
-Commit your changes regularly. Write clear, descriptive commit messages.
+
+```
+
+**2\. Commit your changes regularly.** Write clear, descriptive commit messages.
 
 Bash
+
+```
 git add .
 git commit -m "Added initial LoRa packet transmission logic"
-Sync before you push. Always pull the latest changes from main before pushing your branch to GitHub.
+
+```
+
+**3\. Sync before you push.** Always pull the latest changes from `main` before pushing your branch to GitHub.
 
 Bash
+
+```
 git pull origin main
 git push origin feature/lora-initialization
-Create a Pull Request (PR). Go to GitHub and open a PR to merge your feature branch into main. Tag your teammates to review the code before merging.
+
+```
+
+**4\. Create a Pull Request (PR).** Go to GitHub and open a PR to merge your feature branch into `main`. Tag your teammates to review the code before merging.
+
+* * * * *
 
 📁 Project Structure
+--------------------
+
 Plaintext
+
+```
 SPECTRE_OS/
 ├── .vscode/               # IDE and MCP configurations
 ├── include/               # Custom header files (.h)
@@ -71,10 +104,18 @@ SPECTRE_OS/
 ├── .gitignore             # Ignored files (includes /.pio/)
 ├── platformio.ini         # Environment and dependency configuration
 └── README.md              # Project documentation
-How to add this to GitHub:
-Once you have saved this text inside a README.md file in your VS Code, you can push it to GitHub using the exact same steps you learned earlier:
 
-Bash
-git add README.md
-git commit -m "Added project README file for team reference"
-git push origin main
+```
+
+```
+
+***
+
+### **How to add this to GitHub:**
+Once you have saved this text inside a `README.md` file in your VS Code, you can push it to GitHub using the exact same steps you learned earlier:
+
+1. `git add README.md`
+2. `git commit -m "Added project README file for team reference"`
+3. `git push origin main`
+
+```
