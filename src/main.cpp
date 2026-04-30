@@ -37,7 +37,7 @@
 #include <RadioLib.h>          // LoRa driver  (install via PlatformIO / Library Manager)
 #include <TFT_eSPI.h>          // Display driver (configure User_Setup.h)
 #include <AceButton.h>         // Debounced button handling
-#include "mbedtls/aes.h"       // AES-256 – bundled with ESP-IDF / Arduino-ESP32
+#include "mbedtls/gcm.h"       // AES-GCM (Authenticated Encryption)
 
 using namespace ace_button;
 
@@ -78,9 +78,7 @@ static const uint8_t AES_KEY[32] = {
 // messages, enabling replay attacks and pattern recognition by an adversary.
 
 // Mesh / packet settings
-#define MAX_PAYLOAD_LEN     128     // bytes (after encryption, padded to AES block)
-#define AES_BLOCK           16
-#define ENCRYPTED_PAYLOAD   ((MAX_PAYLOAD_LEN / AES_BLOCK + 1) * AES_BLOCK) // 144 bytes
+#define MAX_PAYLOAD_LEN     128     // bytes (plaintext and ciphertext are same length)
 
 // RTOS queue depths
 #define QUEUE_DEPTH         5
@@ -101,9 +99,9 @@ struct __attribute__((packed)) LoRaPacket {
     uint8_t  messageID;
     uint8_t  hopCount;
     uint8_t  payloadLen;                        // Length of the encrypted blob
-    uint8_t  iv[16];                            // Per-message random IV – prepended so receiver
-                                                // can decrypt without a shared static IV.
-    uint8_t  encrypted[ENCRYPTED_PAYLOAD];      // AES-256-CBC ciphertext
+    uint8_t  iv[12];                            // 12-byte random nonce for AES-GCM
+    uint8_t  tag[16];                           // 16-byte authentication tag
+    uint8_t  encrypted[MAX_PAYLOAD_LEN];        // AES-256-GCM ciphertext (no padding)
 };
 
 // =============================================================================
@@ -155,68 +153,57 @@ static const char* tacMessages[] = {
 // =============================================================================
 
 /**
- * @brief  Encrypt plaintext with AES-256-CBC.
+ * @brief  Encrypt plaintext with AES-256-GCM.
  * @param  plaintext  Input buffer (null-terminated string)
- * @param  iv         16-byte IV generated fresh for this message by the caller.
- *                    It will be consumed (mutated) by mbedtls during CBC chaining.
- *                    The original random bytes must be stored in the packet header
- *                    before calling this function.
- * @param  ciphertext Output buffer (must be >= ENCRYPTED_PAYLOAD bytes)
+ * @param  iv         12-byte IV (nonce) generated fresh for this message.
+ * @param  ciphertext Output buffer (must be >= payload length)
+ * @param  tag        16-byte authentication tag output buffer
  * @return Length of ciphertext in bytes.
  */
-static int aes256Encrypt(const char* plaintext, uint8_t* iv, uint8_t* ciphertext) {
-    mbedtls_aes_context ctx;
-    mbedtls_aes_init(&ctx);
-    mbedtls_aes_setkey_enc(&ctx, AES_KEY, 256);
+static int aes256Encrypt(const char* plaintext, const uint8_t* iv, uint8_t* ciphertext, uint8_t* tag) {
+    mbedtls_gcm_context ctx;
+    mbedtls_gcm_init(&ctx);
+    mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, AES_KEY, 256);
 
-    // PKCS#7 padding into a local staging buffer
-    uint8_t padded[ENCRYPTED_PAYLOAD] = {0};
-    size_t  textLen = strnlen(plaintext, MAX_PAYLOAD_LEN - 1);
-    memcpy(padded, plaintext, textLen);
+    size_t textLen = strnlen(plaintext, MAX_PAYLOAD_LEN - 1);
 
-    size_t padLen    = AES_BLOCK - (textLen % AES_BLOCK);
-    size_t totalLen  = textLen + padLen;
-    for (size_t i = textLen; i < totalLen; i++) {
-        padded[i] = (uint8_t)padLen;   // PKCS#7 pad byte
-    }
+    mbedtls_gcm_crypt_and_tag(&ctx, MBEDTLS_GCM_ENCRYPT, textLen,
+                              iv, 12,
+                              NULL, 0, // No additional authenticated data (AAD)
+                              (const unsigned char*)plaintext, ciphertext,
+                              16, tag);
 
-    // iv is passed in from the packet header (already saved there); mbedtls
-    // mutates the iv buffer internally during CBC – that is expected behaviour.
-    mbedtls_aes_crypt_cbc(&ctx, MBEDTLS_AES_ENCRYPT, totalLen, iv, padded, ciphertext);
-
-    mbedtls_aes_free(&ctx);
-    return (int)totalLen;
+    mbedtls_gcm_free(&ctx);
+    return (int)textLen;
 }
 
 /**
- * @brief  Decrypt AES-256-CBC ciphertext to plaintext.
+ * @brief  Decrypt and authenticate AES-256-GCM ciphertext.
  * @param  ciphertext  Encrypted buffer
- * @param  len         Length of ciphertext (must be multiple of 16)
- * @param  iv          16-byte IV read from the packet header – must match what was
- *                     used during encryption on the transmitting device.
- * @param  plaintext   Output buffer (MAX_PAYLOAD_LEN bytes)
+ * @param  len         Length of ciphertext
+ * @param  iv          12-byte IV read from the packet header
+ * @param  tag         16-byte authentication tag read from the packet header
+ * @param  plaintext   Output buffer
+ * @return true if authentication succeeded, false otherwise.
  */
-static void aes256Decrypt(const uint8_t* ciphertext, int len, const uint8_t* iv, char* plaintext) {
-    mbedtls_aes_context ctx;
-    mbedtls_aes_init(&ctx);
-    mbedtls_aes_setkey_dec(&ctx, AES_KEY, 256);
+static bool aes256Decrypt(const uint8_t* ciphertext, int len, const uint8_t* iv, const uint8_t* tag, char* plaintext) {
+    mbedtls_gcm_context ctx;
+    mbedtls_gcm_init(&ctx);
+    mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, AES_KEY, 256);
 
-    uint8_t decrypted[ENCRYPTED_PAYLOAD] = {0};
-    // mbedtls mutates the IV during CBC – work on a local copy.
-    uint8_t ivCopy[16];
-    memcpy(ivCopy, iv, 16);
-    mbedtls_aes_crypt_cbc(&ctx, MBEDTLS_AES_DECRYPT, len, ivCopy, ciphertext, decrypted);
+    int ret = mbedtls_gcm_auth_decrypt(&ctx, len,
+                                       iv, 12,
+                                       NULL, 0, // No AAD
+                                       tag, 16,
+                                       ciphertext, (unsigned char*)plaintext);
 
-    // Strip PKCS#7 padding
-    uint8_t padByte = decrypted[len - 1];
-    int     dataLen = (padByte > 0 && padByte <= AES_BLOCK) ? (len - padByte) : (len - 1);
+    mbedtls_gcm_free(&ctx);
 
-    // Use memcpy, not strncpy – encrypted payloads can contain embedded null bytes
-    // mid-buffer. strncpy would stop early at the first \0, silently truncating data.
-    memcpy(plaintext, decrypted, dataLen);
-    plaintext[dataLen] = '\0';  // Explicitly null-terminate after the real data
-
-    mbedtls_aes_free(&ctx);
+    if (ret == 0) {
+        plaintext[len] = '\0';
+        return true;
+    }
+    return false;
 }
 
 // =============================================================================
@@ -275,24 +262,17 @@ void taskRadioAndCrypto(void* pvParameters) {
             pkt.messageID  = outMsg.messageID;
             pkt.hopCount   = outMsg.hopCount;
 
-            // Generate a fresh random 16-byte IV for this message.
-            // esp_fill_random() draws from the ESP32's hardware RNG (RF noise source).
-            // The IV is stored in the packet header so the receiver can decrypt it –
-            // it is not a secret, but it MUST be unique per message to prevent
-            // replay attacks and ciphertext pattern recognition.
-            esp_fill_random(pkt.iv, 16);
+            // Generate a fresh random 12-byte IV for this message.
+            esp_fill_random(pkt.iv, 12);
 
-            // Pass a copy of the IV to encrypt – mbedtls will mutate it during CBC
-            // chaining, so we preserve the original in pkt.iv for the packet header.
-            uint8_t ivCopyTx[16];
-            memcpy(ivCopyTx, pkt.iv, 16);
-            int cLen = aes256Encrypt(outMsg.payload, ivCopyTx, pkt.encrypted);
+            int cLen = aes256Encrypt(outMsg.payload, pkt.iv, pkt.encrypted, pkt.tag);
             pkt.payloadLen = (uint8_t)cLen;
 
             // Stop listening while we transmit
             radio.standby();
 
-            size_t pktSize = 4 + cLen;   // 4 header bytes + ciphertext
+            // Calculate size dynamically since payload isn't padded
+            size_t pktSize = sizeof(LoRaPacket) - MAX_PAYLOAD_LEN + cLen;
             state = radio.transmit((uint8_t*)&pkt, pktSize);
 
             if (state == RADIOLIB_ERR_NONE) {
@@ -328,30 +308,31 @@ void taskRadioAndCrypto(void* pvParameters) {
                     memset(&inMsg, 0, sizeof(inMsg));
                     inMsg.messageID = rxPkt->messageID;
                     inMsg.hopCount  = rxPkt->hopCount;
-                    // The IV used by the transmitter is carried in the packet header.
-                    // Pass it directly so CBC decryption uses the correct IV.
-                    aes256Decrypt(rxPkt->encrypted, rxPkt->payloadLen, rxPkt->iv, inMsg.payload);
+                    
+                    bool authOk = aes256Decrypt(rxPkt->encrypted, rxPkt->payloadLen, rxPkt->iv, rxPkt->tag, inMsg.payload);
 
-                    Serial.printf("[Radio][RX] Decrypted: \"%s\"\n", inMsg.payload);
+                    if (authOk) {
+                        Serial.printf("[Radio][RX] Decrypted: \"%s\"\n", inMsg.payload);
 
-                    // Push to UI task
-                    xQueueSend(rxQueue, &inMsg, 0);
+                        // Push to UI task
+                        xQueueSend(rxQueue, &inMsg, 0);
 
-                    // ----------------------------------------------------------
-                    // STORE-AND-FORWARD MESH RELAY LOGIC
-                    // If this packet still has hops remaining, rebroadcast it so
-                    // other nodes in the mesh can receive it.
-                    // ----------------------------------------------------------
-                    if (rxPkt->hopCount > 0) {
-                        rxPkt->hopCount--;
-                        radio.standby();
-                        // Small random delay to reduce collision probability
-                        vTaskDelay((esp_random() % 200 + 50) / portTICK_PERIOD_MS);
-                        radio.transmit(buf, 4 + rxPkt->payloadLen);
-                        Serial.printf("[Radio][MESH] Relayed packet (hops left: %u)\n",
-                                      rxPkt->hopCount);
-                        rxFlag = false;
-                        radio.startReceive();
+                        // ----------------------------------------------------------
+                        // STORE-AND-FORWARD MESH RELAY LOGIC
+                        // ----------------------------------------------------------
+                        if (rxPkt->hopCount > 0) {
+                            rxPkt->hopCount--;
+                            radio.standby();
+                            vTaskDelay((esp_random() % 200 + 50) / portTICK_PERIOD_MS);
+                            size_t relaySize = sizeof(LoRaPacket) - MAX_PAYLOAD_LEN + rxPkt->payloadLen;
+                            radio.transmit(buf, relaySize);
+                            Serial.printf("[Radio][MESH] Relayed packet (hops left: %u)\n",
+                                          rxPkt->hopCount);
+                            rxFlag = false;
+                            radio.startReceive();
+                        }
+                    } else {
+                        Serial.println("[Radio][RX] Authentication failed. Packet modified or wrong key!");
                     }
                 }
             } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
