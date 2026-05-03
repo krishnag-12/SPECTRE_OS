@@ -3,12 +3,13 @@
 //                  for Remote Environments
 // =============================================================================
 
-#define SIMULATOR_MODE 0   // 0 = real hardware
+#define SIMULATOR_MODE 0   
+#define ENABLE_RADIO_TASK 1  
 
 #include <Arduino.h>
-#include <SPI.h>
+#include <Wire.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_ILI9341.h>
+#include <Adafruit_SSD1306.h> 
 #include <AceButton.h>
 
 // Cryptography Libraries
@@ -45,9 +46,9 @@ using namespace ace_button;
   #define LORA_DIO1_PIN  RADIOLIB_NC
 #endif
 
-#define TFT_CS   15
-#define TFT_DC    2
-#define TFT_RST   4   
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET   -1
 
 #define BTN_UP_PIN    32
 #define BTN_DOWN_PIN  33
@@ -57,7 +58,7 @@ using namespace ace_button;
 // ECDH KEY EXCHANGE & AES CONFIG
 // =============================================================================
 
-static uint8_t AES_KEY[32] = {0}; // Will be dynamically generated
+static uint8_t AES_KEY[32] = {0}; 
 static bool keyExchangeComplete = false;
 
 mbedtls_ecdh_context ecdh_ctx;
@@ -68,7 +69,6 @@ static uint8_t myPublicKey[65];
 size_t pubKeyLen;
 
 #define MAX_PAYLOAD_LEN   128
-#define AES_BLOCK         16
 #define QUEUE_DEPTH       5
 
 // =============================================================================
@@ -82,7 +82,7 @@ struct MessageEvent {
 };
 
 struct __attribute__((packed)) LoRaPacket {
-    uint8_t  magicByte;                         // 0xAB = valid Encrypted S.P.E.C.T.R.E. packet
+    uint8_t  magicByte;                         
     uint8_t  messageID;
     uint8_t  hopCount;
     uint8_t  payloadLen;                        
@@ -92,24 +92,24 @@ struct __attribute__((packed)) LoRaPacket {
 };
 
 struct __attribute__((packed)) LoRaKeyExchangePacket {
-    uint8_t  magicByte;                         // 0xAC = Key Exchange Packet
+    uint8_t  magicByte;                         
     uint8_t  pubKeyLen;
     uint8_t  publicKey[65];
 };
 
 // =============================================================================
-// GLOBALS
+// GLOBALS & DISPLAY SETUP
 // =============================================================================
 
 QueueHandle_t txQueue;
 QueueHandle_t rxQueue;
-TaskHandle_t  taskRadioHandle, taskUIHandle, taskInputHandle;
+TaskHandle_t  taskRadioHandle;
 
 #if !SIMULATOR_MODE
   SX1278 radio = new Module(LORA_NSS_PIN, LORA_DIO0_PIN, LORA_RESET_PIN, LORA_DIO1_PIN);
 #endif
 
-Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 AceButton btnUp(BTN_UP_PIN);
 AceButton btnDown(BTN_DOWN_PIN);
@@ -117,31 +117,24 @@ AceButton btnSel(BTN_SEL_PIN);
 
 volatile bool rxFlag = false;
 
-// =============================================================================
-// MENU STATE
-// =============================================================================
-
 enum MenuState { MENU_MAIN, MENU_INBOX, MENU_COMPOSE };
-
 static MenuState   currentMenu = MENU_MAIN;
 static int         menuCursor  = 0;
+static bool        needRedraw  = false;
+static MenuState   nextMenu    = MENU_MAIN;
+static bool        menuChanged = false;
 
 static const char* menuItems[] = {
     "MAYDAY TX", "EXTRACT TX", "REGROUP TX", "SITREP TX", "KEY EXCH TX", "INBOX"
 };
 static const int menuCount = 6;
-
 static const char* tacMessages[] = {
     "MAYDAY! Sector 4. Immediate assistance required.",
     "Extraction requested at primary LZ. Awaiting confirmation.",
     "All units regroup at Checkpoint Bravo.",
     "Status nominal. Holding position. No enemy contact.",
-    "BROADCASTING PUBLIC ECDH KEY..." // Matches the "KEY EXCH TX" index
+    "BROADCASTING PUBLIC ECDH KEY..."
 };
-
-static volatile bool      needRedraw  = false;
-static volatile MenuState nextMenu    = MENU_MAIN;
-static volatile bool      menuChanged = false;
 
 // =============================================================================
 // CRYPTO HELPERS
@@ -152,26 +145,20 @@ void initCryptoAndGenerateKeys() {
     mbedtls_ecdh_init(&ecdh_ctx);
     mbedtls_ctr_drbg_init(&ctr_drbg);
     mbedtls_entropy_init(&entropy);
-
     const char *pers = "spectre_rng";
     mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers));
-
-    mbedtls_ecp_group_load(&ecdh_ctx.MBEDTLS_PRIVATE(grp), MBEDTLS_ECP_DP_SECP256R1);
-    mbedtls_ecdh_gen_public(&ecdh_ctx.MBEDTLS_PRIVATE(grp), &ecdh_ctx.MBEDTLS_PRIVATE(d), &ecdh_ctx.MBEDTLS_PRIVATE(Q), mbedtls_ctr_drbg_random, &ctr_drbg);
-    mbedtls_ecp_point_write_binary(&ecdh_ctx.MBEDTLS_PRIVATE(grp), &ecdh_ctx.MBEDTLS_PRIVATE(Q), MBEDTLS_ECP_PF_UNCOMPRESSED, &pubKeyLen, myPublicKey, sizeof(myPublicKey));
-    
+    mbedtls_ecdh_setup(&ecdh_ctx, MBEDTLS_ECP_DP_SECP256R1);
+    mbedtls_ecdh_make_public(&ecdh_ctx, &pubKeyLen, myPublicKey, sizeof(myPublicKey), mbedtls_ctr_drbg_random, &ctr_drbg);
     Serial.println("[Crypto] Keys generated successfully.");
 }
 
 bool deriveSharedAESKey(const uint8_t* peerPublicKey, size_t peerKeyLen) {
     Serial.println("[Crypto] Deriving shared secret from peer key...");
     mbedtls_ecdh_read_public(&ecdh_ctx, peerPublicKey, peerKeyLen);
-    mbedtls_ecdh_compute_shared(&ecdh_ctx.MBEDTLS_PRIVATE(grp), &ecdh_ctx.MBEDTLS_PRIVATE(z), &ecdh_ctx.MBEDTLS_PRIVATE(Qp), &ecdh_ctx.MBEDTLS_PRIVATE(d), mbedtls_ctr_drbg_random, &ctr_drbg);
-
     uint8_t sharedSecret[32];
-    mbedtls_mpi_write_binary(&ecdh_ctx.MBEDTLS_PRIVATE(z), sharedSecret, sizeof(sharedSecret));
-    mbedtls_sha256(sharedSecret, sizeof(sharedSecret), AES_KEY, 0);
-
+    size_t secretLen = 0;
+    mbedtls_ecdh_calc_secret(&ecdh_ctx, &secretLen, sharedSecret, sizeof(sharedSecret), mbedtls_ctr_drbg_random, &ctr_drbg);
+    mbedtls_sha256(sharedSecret, secretLen, AES_KEY, 0);
     keyExchangeComplete = true;
     Serial.println("[Crypto] AES_KEY derived and locked. Comms are now secure.");
     return true;
@@ -201,22 +188,21 @@ static bool aes256Decrypt(const uint8_t* ciphertext, int len, const uint8_t* iv,
 }
 
 // =============================================================================
-// ISR
+// CORE 0: RADIO TASK
 // =============================================================================
 #if !SIMULATOR_MODE
 void IRAM_ATTR onDio0Rise() { rxFlag = true; }
 #endif
 
-// =============================================================================
-// CORE 0: RADIO & CRYPTO TASK
-// =============================================================================
 void taskRadioAndCrypto(void* pvParameters) {
     Serial.printf("[Radio] Task started on Core %d\n", xPortGetCoreID());
+    
+    int state = RADIOLIB_ERR_NONE; 
     LoRaPacket pkt;
     MessageEvent outMsg, inMsg;
 
 #if !SIMULATOR_MODE
-    int state = radio.begin(LORA_FREQUENCY, LORA_BANDWIDTH, LORA_SF, LORA_CR, LORA_SYNC_WORD, LORA_TX_POWER);
+    state = radio.begin(LORA_FREQUENCY, LORA_BANDWIDTH, LORA_SF, LORA_CR, LORA_SYNC_WORD, LORA_TX_POWER);
     if (state != RADIOLIB_ERR_NONE) {
         MessageEvent errMsg;
         errMsg.messageID = 0xFF;
@@ -231,8 +217,6 @@ void taskRadioAndCrypto(void* pvParameters) {
 
     for (;;) {
         if (xQueueReceive(txQueue, &outMsg, 0) == pdPASS) {
-            
-            // Handle Key Exchange Transmission
             if (outMsg.messageID == 0xFE) {
                 LoRaKeyExchangePacket keyPkt;
                 keyPkt.magicByte = 0xAC;
@@ -243,27 +227,22 @@ void taskRadioAndCrypto(void* pvParameters) {
                 state = radio.transmit((uint8_t*)&keyPkt, sizeof(LoRaKeyExchangePacket));
                 rxFlag = false;
                 radio.startReceive();
-                Serial.println("[Radio][TX] Key Exchange Broadcast Sent.");
                 continue;
             }
 
-            // Prevent transmitting if we don't have a shared key
             if (!keyExchangeComplete) {
                 MessageEvent errMsg;
                 errMsg.messageID = 0xFF;
-                strncpy(errMsg.payload, "ERR: No Shared Key! Run Key Exchange.", MAX_PAYLOAD_LEN);
+                strncpy(errMsg.payload, "ERR: Run Key Exchange.", MAX_PAYLOAD_LEN);
                 xQueueSend(rxQueue, &errMsg, 0);
                 continue;
             }
 
-            // Normal Encrypted Transmission
-            Serial.printf("[Radio][TX] MsgID %u: \"%s\"\n", outMsg.messageID, outMsg.payload);
             memset(&pkt, 0, sizeof(pkt));
             pkt.magicByte  = 0xAB;
             pkt.messageID  = outMsg.messageID;
             pkt.hopCount   = outMsg.hopCount;
             esp_fill_random(pkt.iv, 12);
-
             int cLen = aes256Encrypt(outMsg.payload, pkt.iv, pkt.encrypted, pkt.tag);
             pkt.payloadLen = (uint8_t)cLen;
 
@@ -279,39 +258,28 @@ void taskRadioAndCrypto(void* pvParameters) {
 #if !SIMULATOR_MODE
         if (rxFlag) {
             rxFlag = false;
-            
-            // --> CRITICAL FIX: Get actual packet length from the LoRa chip
             size_t rxLen = radio.getPacketLength(); 
-            uint8_t buf[sizeof(LoRaPacket)] = {0}; // Zero-out buffer for safety
+            uint8_t buf[sizeof(LoRaPacket)] = {0}; 
             
             if (radio.readData(buf, rxLen) == RADIOLIB_ERR_NONE) {
-                
-                // Handle Key Exchange Reception
                 if (buf[0] == 0xAC) {
                     LoRaKeyExchangePacket* rxKeyPkt = (LoRaKeyExchangePacket*)buf;
                     deriveSharedAESKey(rxKeyPkt->publicKey, rxKeyPkt->pubKeyLen);
-                    
                     memset(&inMsg, 0, sizeof(inMsg));
-                    inMsg.messageID = 0xFD; // System Info ID
+                    inMsg.messageID = 0xFD; 
                     strncpy(inMsg.payload, "SYS: Secure Key Exchanged!", MAX_PAYLOAD_LEN);
                     xQueueSend(rxQueue, &inMsg, 0);
                 } 
-                // Handle Normal Encrypted Reception
                 else if (buf[0] == 0xAB) {
-                    if (!keyExchangeComplete) continue; // Ignore if we can't decrypt
-
+                    if (!keyExchangeComplete) continue; 
                     LoRaPacket* rxPkt = (LoRaPacket*)buf;
                     memset(&inMsg, 0, sizeof(inMsg));
                     inMsg.messageID = rxPkt->messageID;
                     inMsg.hopCount  = rxPkt->hopCount;
                     
                     bool authOk = aes256Decrypt(rxPkt->encrypted, rxPkt->payloadLen, rxPkt->iv, rxPkt->tag, inMsg.payload);
-
                     if (authOk) {
-                        Serial.printf("[Radio][RX] Decrypted: \"%s\"\n", inMsg.payload);
                         xQueueSend(rxQueue, &inMsg, 0);
-
-                        // Mesh Relay Logic
                         if (rxPkt->hopCount > 0) {
                             rxPkt->hopCount--;
                             radio.standby();
@@ -321,8 +289,6 @@ void taskRadioAndCrypto(void* pvParameters) {
                             rxFlag = false;
                             radio.startReceive();
                         }
-                    } else {
-                        Serial.println("[Radio][RX] Auth failed. Packet modified or wrong key!");
                     }
                 }
             }
@@ -337,150 +303,49 @@ void taskRadioAndCrypto(void* pvParameters) {
 // =============================================================================
 
 void drawStatusBar(int battery, int signal, const char* mode) {
-    tft.fillRect(0, 0, 320, 16, ILI9341_DARKGREY);
-    tft.setTextSize(1);
-    tft.setTextColor(ILI9341_WHITE);
-    tft.setCursor(3, 4);   tft.print("BAT:"); tft.print(battery); tft.print("%");
-    tft.setCursor(110, 4); tft.print("SIG:"); tft.print(signal);
-    tft.setCursor(220, 4);
-    tft.setTextColor(strcmp(mode, "TX") == 0 ? ILI9341_RED : ILI9341_GREEN);
-    tft.print("Mode:"); tft.print(mode);
-}
-
-void drawBootLogo() {
-    tft.fillScreen(ILI9341_BLACK);
-    tft.setTextColor(ILI9341_GREEN);
-    tft.setTextSize(1);
-    int y = 30;
-    tft.setCursor(5, y);     tft.println("   ___  ____  ____  ___  ____  ____  ____");
-    tft.setCursor(5, y+=10); tft.println("  / __)(  _ \\( ___)/ __)(_  _)(  _ \\( ___)");
-    tft.setCursor(5, y+=10); tft.println("  \\__ \\ ) _/ ) _) ( (__   )(   )   / ) _) ");
-    tft.setCursor(5, y+=10); tft.println("  (___/(__)  (____) \\___) (__) (_)\\_)(____) ");
-    tft.setTextSize(2);
-    tft.setTextColor(ILI9341_WHITE);
-    tft.setCursor(55, y+=20); tft.println("S.P.E.C.T.R.E OS");
-    tft.drawFastHLine(0, y+=25, 320, ILI9341_GREEN);
-    tft.setTextSize(1);
-    tft.setTextColor(ILI9341_CYAN);
-    tft.setCursor(85, y+=10); tft.println("Initializing systems...");
-    tft.drawRect(40, y+=20, 240, 10, ILI9341_WHITE);
-    for (int i = 0; i <= 240; i += 20) {
-        tft.fillRect(41, y+1, i, 8, ILI9341_GREEN);
-        delay(80);
-    }
-    tft.setTextColor(ILI9341_GREEN);
-    tft.setCursor(120, y+18);
-    tft.println("[ OK ]");
+    display.fillRect(0, 0, 128, 9, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_BLACK); 
+    display.setCursor(1, 1);
+    display.printf("B:%d%% S:%d %s", battery, signal, mode);
 }
 
 static void drawMainMenu() {
-    tft.fillScreen(ILI9341_BLACK);
+    display.clearDisplay();
     drawStatusBar(85, 72, "STBY");
-    tft.setTextSize(2);
-    tft.setTextColor(ILI9341_GREEN);
-    tft.setCursor(70, 30);
-    tft.println("S.P.E.C.T.R.E OS");
-    tft.drawFastHLine(0, 55, 320, ILI9341_GREEN);
-    tft.setTextSize(1);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    int startY = 12;
     for (int i = 0; i < menuCount; i++) {
-        tft.setCursor(20, 75 + i * 20);
+        display.setCursor(0, startY + (i * 8));
         if (i == menuCursor) {
-            tft.setTextColor(ILI9341_BLACK, ILI9341_GREEN);
-            tft.print("> ["); tft.print(i+1); tft.print("] "); tft.println(menuItems[i]);
+            display.fillRect(0, startY + (i * 8) - 1, 128, 9, SSD1306_WHITE);
+            display.setTextColor(SSD1306_BLACK);
+            display.print("> "); display.print(menuItems[i]);
+            display.setTextColor(SSD1306_WHITE); 
         } else {
-            tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-            tft.print("  ["); tft.print(i+1); tft.print("] "); tft.println(menuItems[i]);
+            display.print("  "); display.print(menuItems[i]);
         }
     }
-    tft.drawFastHLine(0, 200, 320, ILI9341_DARKGREY);
-    tft.setTextColor(ILI9341_DARKGREY, ILI9341_BLACK);
-    tft.setCursor(85, 210);
-    tft.println("SPECTRE OS v0.3-beta"); 
+    display.display();
 }
 
 static void drawInbox(const MessageEvent& msg) {
-    tft.fillScreen(ILI9341_BLACK);
+    display.clearDisplay();
     drawStatusBar(85, 72, "RX");
-    tft.setTextColor(ILI9341_CYAN, ILI9341_BLACK);
-    tft.setTextSize(2);
-    tft.setCursor(5, 25); tft.print("== INBOX ==");
-    tft.drawFastHLine(0, 45, 320, ILI9341_CYAN);
-    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-    tft.setTextSize(1);
-    tft.setTextWrap(true);
-    tft.setCursor(5, 55); tft.print(msg.payload);
-    tft.setTextColor(ILI9341_YELLOW, ILI9341_BLACK);
-    char info[32];
-    snprintf(info, sizeof(info), "MsgID:%u Hops:%u", msg.messageID, msg.hopCount);
-    tft.setCursor(5, tft.height() - 14);
-    tft.print(info);
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 12);
+    display.printf("MsgID:%u Hops:%u", msg.messageID, msg.hopCount);
+    display.drawLine(0, 21, 128, 21, SSD1306_WHITE);
+    display.setCursor(0, 24);
+    display.setTextWrap(true);
+    display.print(msg.payload);
+    display.display(); 
 }
 
 // =============================================================================
-// CORE 1: UI TASK
-// =============================================================================
-void taskUI(void* pvParameters) {
-    Serial.printf("[UI] Task started on Core %d\n", xPortGetCoreID());
-    currentMenu = MENU_MAIN;
-    drawMainMenu();
-
-    MessageEvent inMsg;
-    for (;;) {
-        if (menuChanged) {
-            menuChanged = false;
-            currentMenu = (MenuState)nextMenu;
-            switch (currentMenu) {
-                case MENU_MAIN:
-                    drawMainMenu();
-                    break;
-                case MENU_INBOX:
-                    tft.fillScreen(ILI9341_BLACK);
-                    drawStatusBar(85, 72, "RX");
-                    tft.setTextColor(ILI9341_CYAN, ILI9341_BLACK);
-                    tft.setTextSize(2);
-                    tft.setCursor(5, 25); tft.print("== INBOX ==");
-                    tft.drawFastHLine(0, 45, 320, ILI9341_CYAN);
-                    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-                    tft.setTextSize(1);
-                    tft.setCursor(5, 55); tft.print("Awaiting secure transmission...");
-                    break;
-                case MENU_COMPOSE:
-                    tft.fillScreen(ILI9341_BLACK);
-                    drawStatusBar(85, 72, "TX");
-                    tft.setTextColor(ILI9341_YELLOW, ILI9341_BLACK);
-                    tft.setTextSize(2);
-                    tft.setCursor(5, 25); tft.print("[ TRANSMITTING ]");
-                    tft.setTextSize(1);
-                    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-                    tft.setCursor(5, 55); tft.print(tacMessages[menuCursor]);
-                    vTaskDelay(1200 / portTICK_PERIOD_MS);
-                    currentMenu = MENU_MAIN;
-                    drawMainMenu();
-                    break;
-            }
-        }
-        if (needRedraw) {
-            needRedraw = false;
-            if (currentMenu == MENU_MAIN) drawMainMenu();
-        }
-        if (xQueueReceive(rxQueue, &inMsg, 0) == pdPASS) {
-            if (inMsg.messageID == 0xFF) {
-                tft.fillScreen(ILI9341_RED);
-                tft.setTextColor(ILI9341_WHITE, ILI9341_RED);
-                tft.setTextSize(1);
-                tft.setCursor(5, 20); tft.print("RADIO ERROR!");
-                tft.setCursor(5, 40); tft.print(inMsg.payload);
-            } else {
-                drawInbox(inMsg);
-                currentMenu = MENU_INBOX;
-            }
-        }
-        vTaskDelay(20 / portTICK_PERIOD_MS);
-    }
-}
-
-// =============================================================================
-// BUTTON HANDLER & INPUT TASK
+// BUTTON HANDLER
 // =============================================================================
 static void handleButtonEvent(AceButton* button, uint8_t eventType, uint8_t) {
     if (eventType != AceButton::kEventPressed) return;
@@ -493,16 +358,12 @@ static void handleButtonEvent(AceButton* button, uint8_t eventType, uint8_t) {
             menuCursor = (menuCursor + 1) % menuCount;
             needRedraw = true;
         } else if (pin == BTN_SEL_PIN) {
-            if (menuCursor == menuCount - 1) { // INBOX selected
+            if (menuCursor == menuCount - 1) { 
                 nextMenu = MENU_INBOX; menuChanged = true;
             } else {
                 MessageEvent txMsg;
-                // If "KEY EXCH TX" is selected (index 4)
-                if (menuCursor == menuCount - 2) {
-                    txMsg.messageID = 0xFE; // Special trigger ID
-                } else {
-                    txMsg.messageID = (uint8_t)(menuCursor + 1);
-                }
+                if (menuCursor == menuCount - 2) txMsg.messageID = 0xFE; 
+                else txMsg.messageID = (uint8_t)(menuCursor + 1);
                 
                 txMsg.hopCount  = 3;
                 strncpy(txMsg.payload, tacMessages[menuCursor], MAX_PAYLOAD_LEN - 1);
@@ -517,26 +378,13 @@ static void handleButtonEvent(AceButton* button, uint8_t eventType, uint8_t) {
     }
 }
 
-void taskInput(void* pvParameters) {
-    Serial.printf("[Input] Task started on Core %d\n", xPortGetCoreID());
-    pinMode(BTN_UP_PIN,   INPUT_PULLUP);
-    pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
-    pinMode(BTN_SEL_PIN,  INPUT_PULLUP);
-    ButtonConfig* config = ButtonConfig::getSystemButtonConfig();
-    config->setEventHandler(handleButtonEvent);
-    config->setFeature(ButtonConfig::kFeatureClick);
-    config->setFeature(ButtonConfig::kFeatureLongPress);
-    for (;;) {
-        btnUp.check();
-        btnDown.check();
-        btnSel.check();
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
-}
+// =============================================================================
+// NATIVE CORE 1: SETUP & MAIN UI LOOP
+// =============================================================================
 
-// =============================================================================
-// SETUP & LOOP
-// =============================================================================
+static uint32_t composeDoneMs = 0;
+static bool     composePending = false;
+
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -545,37 +393,131 @@ void setup() {
     Serial.println("==============================");
 
     Serial.println("[Setup] Initializing display...");
+    Wire.begin(21, 22);
+    Wire.setClock(100000); 
+    delay(50); // Let caps stabilize
+
+    // true  = perform software reset sequence (critical for clone SSD1306 modules)
+    // false = don't call Wire.begin() internally (we already locked the pins)
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C, true, false)) {
+        Serial.println(F("\n\n[FATAL] SSD1306 allocation failed. Check wiring!\n\n"));
+        while (true) { delay(100); } 
+    }
     
-    // Lock the SPI bus and free the CS pin for Adafruit
-    SPI.begin(18, 19, 23, -1); 
-    
-    tft.begin();
-    tft.setRotation(3);
-    tft.fillScreen(ILI9341_BLACK);
+    display.dim(false); // Make sure contrast isn't 0
+
+    // =========================================================================
+    // THE PROOF OF LIFE SCREEN
+    // =========================================================================
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(2);
+    display.setCursor(18, 15);
+    display.println("SPECTRE");
+    display.setTextSize(1);
+    display.setCursor(16, 40);
+    display.println("DISPLAY ONLINE");
+    display.display();
+
     Serial.println("[Setup] Display OK.");
+    delay(2500); // Wait 2.5 seconds to admire your fully working display
+    // =========================================================================
 
-    // Generate our public/private keypair at boot
-    initCryptoAndGenerateKeys();
-
-    drawBootLogo();
-    delay(1500);
+    currentMenu = MENU_MAIN;
     drawMainMenu();
+
+    initCryptoAndGenerateKeys();
 
     txQueue = xQueueCreate(QUEUE_DEPTH, sizeof(MessageEvent));
     rxQueue = xQueueCreate(QUEUE_DEPTH, sizeof(MessageEvent));
-    if (!txQueue || !rxQueue) {
-        Serial.println("[FATAL] Queue creation failed.");
-        while (true) {}
-    }
-
-    Serial.println("[Setup] Starting RTOS tasks...");
     
-    // Increased stack size from 8192 to 24576 to prevent mbedtls stack overflow
-    xTaskCreatePinnedToCore(taskRadioAndCrypto, "RadioTask",  24576, NULL, 3, &taskRadioHandle, 0);
-    xTaskCreatePinnedToCore(taskUI,             "UITask",     6144,  NULL, 2, &taskUIHandle,    1);
-    xTaskCreatePinnedToCore(taskInput,          "InputTask",  4096,  NULL, 3, &taskInputHandle, 1);
+#if ENABLE_RADIO_TASK
+    Serial.println("[Setup] Starting Background Radio Task on Core 0...");
+    // 49152 byte stack allocation safely buffers mbedTLS memory demands
+    xTaskCreatePinnedToCore(taskRadioAndCrypto, "RadioTask", 49152, NULL, 3, &taskRadioHandle, 0);
+#endif
+
+    pinMode(BTN_UP_PIN,   INPUT_PULLUP);
+    pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
+    pinMode(BTN_SEL_PIN,  INPUT_PULLUP);
+    ButtonConfig* config = ButtonConfig::getSystemButtonConfig();
+    config->setEventHandler(handleButtonEvent);
+    config->setFeature(ButtonConfig::kFeatureClick);
 }
 
 void loop() {
-    vTaskDelete(NULL);
+    // Non-blocking UI timer for composition screens
+    if (composePending && (millis() - composeDoneMs > 1200)) {
+        composePending = false;
+        currentMenu = MENU_MAIN;
+        drawMainMenu();
+    }
+
+    btnUp.check();
+    btnDown.check();
+    btnSel.check();
+
+    if (menuChanged) {
+        menuChanged = false;
+        currentMenu = nextMenu;
+        switch (currentMenu) {
+            case MENU_MAIN:
+                drawMainMenu();
+                break;
+            case MENU_INBOX:
+                display.clearDisplay();
+                drawStatusBar(85, 72, "RX");
+                display.setTextColor(SSD1306_WHITE);
+                display.setTextSize(1);
+                display.setCursor(0, 15);
+                display.println("== INBOX ==");
+                display.drawLine(0, 25, 128, 25, SSD1306_WHITE);
+                display.setCursor(0, 35);
+                display.println("Awaiting tx...");
+                display.display();
+                break;
+            case MENU_COMPOSE:
+                display.clearDisplay();
+                drawStatusBar(85, 72, "TX");
+                display.setTextColor(SSD1306_WHITE);
+                display.setTextSize(1);
+                display.setCursor(0, 15);
+                display.println("[ TRANSMITTING ]");
+                display.setCursor(0, 30);
+                display.setTextWrap(true);
+                display.print(tacMessages[menuCursor]);
+                display.display();
+                
+                composePending = true;
+                composeDoneMs = millis();
+                break;
+        }
+    }
+    
+    if (needRedraw) {
+        needRedraw = false;
+        if (currentMenu == MENU_MAIN) drawMainMenu();
+    }
+
+    // Process incoming radio messages
+    MessageEvent inMsg;
+    if (xQueueReceive(rxQueue, &inMsg, 0) == pdPASS) {
+        if (inMsg.messageID == 0xFF) {
+            display.clearDisplay();
+            display.setTextColor(SSD1306_BLACK, SSD1306_WHITE); 
+            display.setTextSize(1);
+            display.setCursor(0, 15);
+            display.println(" RADIO ERROR! ");
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(0, 30);
+            display.print(inMsg.payload);
+            display.display();
+        } else {
+            drawInbox(inMsg);
+            currentMenu = MENU_INBOX;
+        }
+    }
+    
+    // Yield to the RTOS scheduler to allow background tasks to run without blocking
+    taskYIELD(); 
 }
